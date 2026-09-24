@@ -1,0 +1,8 @@
+/target
+Cargo.lock
+*.sigil
+*.key
+*.pub
+sigil.trust.json
+sigil.lock
+registry_storage/
