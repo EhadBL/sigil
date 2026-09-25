@@ -281,3 +281,38 @@ fn test_symlink_zip_slip_payload_strictly_rejected() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_dependency_tampering_invalidates_envelope_signature() {
+    let (signing_key, _verifying_key) = crypto::generate_keypair();
+    let mut manifest = SigilManifest::default_template("secure-app");
+    manifest.dependencies.insert("safe-dep".into(), "1.0.0".into());
+    manifest.dependencies.insert("crypto-lib".into(), "2.4.0".into());
+
+    let envelope = SigilEnvelope::sign_and_create(manifest.clone(), "dummy_hash".into(), vec![], &signing_key).unwrap();
+    assert!(envelope.verify_signature().is_ok(), "Initial envelope signature must verify");
+
+    // Case 1: Tamper with existing dependency version
+    let mut tampered_version = envelope.clone();
+    tampered_version.manifest.dependencies.insert("safe-dep".into(), "1.0.1-malicious".into());
+    assert!(
+        tampered_version.verify_signature().is_err(),
+        "Tampering with dependency version must invalidate cryptographic signature!"
+    );
+
+    // Case 2: Inject unauthorized third-party dependency
+    let mut injected_dep = envelope.clone();
+    injected_dep.manifest.dependencies.insert("backdoor-dep".into(), "0.0.1".into());
+    assert!(
+        injected_dep.verify_signature().is_err(),
+        "Injecting dependency into manifest must invalidate cryptographic signature!"
+    );
+
+    // Case 3: Remove legitimate dependency
+    let mut stripped_dep = envelope.clone();
+    stripped_dep.manifest.dependencies.remove("crypto-lib");
+    assert!(
+        stripped_dep.verify_signature().is_err(),
+        "Removing dependency from manifest must invalidate cryptographic signature!"
+    );
+}

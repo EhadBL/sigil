@@ -2,7 +2,7 @@ use crate::crypto::{self, CryptoError};
 use crate::manifest::{Capabilities, SigilManifest};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -43,7 +43,8 @@ pub struct SigilEnvelope {
 
 impl SigilEnvelope {
     /// Constructs a canonical byte slice to be signed or verified.
-    /// This prevents signature malleability and ensures zero-trust authenticity.
+    /// This prevents signature malleability and ensures zero-trust authenticity,
+    /// including strict cryptographic binding over declared capabilities and dependencies.
     pub fn canonical_payload(
         name: &str,
         version: &str,
@@ -52,6 +53,7 @@ impl SigilEnvelope {
         timestamp: i64,
         author_pubkey: &str,
         capabilities: &Capabilities,
+        dependencies: &HashMap<String, String>,
     ) -> Result<Vec<u8>, EnvelopeError> {
         // Deterministic JSON map representation
         let mut map = BTreeMap::new();
@@ -62,6 +64,12 @@ impl SigilEnvelope {
         map.insert("timestamp", serde_json::to_value(timestamp)?);
         map.insert("author_pubkey", serde_json::to_value(author_pubkey)?);
         map.insert("capabilities", serde_json::to_value(capabilities)?);
+
+        let mut sorted_deps = BTreeMap::new();
+        for (k, v) in dependencies {
+            sorted_deps.insert(k.as_str(), v.as_str());
+        }
+        map.insert("dependencies", serde_json::to_value(&sorted_deps)?);
 
         let canonical_bytes = serde_json::to_vec(&map)?;
         Ok(canonical_bytes)
@@ -92,6 +100,7 @@ impl SigilEnvelope {
             timestamp,
             &author_pubkey,
             &manifest.capabilities,
+            &manifest.dependencies,
         )?;
 
         let signature = crypto::sign_payload(signing_key, &canonical);
@@ -119,6 +128,7 @@ impl SigilEnvelope {
             self.timestamp,
             &self.author_pubkey,
             &self.manifest.capabilities,
+            &self.manifest.dependencies,
         )?;
 
         crypto::verify_signature(&verifying_key, &canonical, &self.signature)?;
