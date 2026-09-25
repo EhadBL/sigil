@@ -159,6 +159,16 @@ pub enum TrustCommands {
         pubkey: String,
     },
 
+    /// Revoke a compromised or retired publisher key
+    Revoke {
+        /// Public key in hex
+        pubkey: String,
+
+        /// Reason for revocation (e.g. "Key leaked", "Employee departure")
+        #[arg(short, long, default_value = "Compromised or retired key")]
+        reason: String,
+    },
+
     /// List all trusted publisher public keys in explicit keyring
     List,
 }

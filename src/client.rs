@@ -1,4 +1,5 @@
 use crate::lockfile::SigilLockfile;
+use crate::merkle::MerkleInclusionProof;
 use crate::packager::Packager;
 use crate::trust::TrustStore;
 use crate::verifier::Verifier;
@@ -23,6 +24,8 @@ pub enum ClientError {
     Registry(String),
     #[error("Untrusted publisher key {pubkey} for package {package}! Run 'sigil trust add' to approve.")]
     UntrustedPublisher { pubkey: String, package: String },
+    #[error("Security alert: {0}")]
+    SecurityAlert(String),
 }
 
 pub struct SigilClient {
@@ -122,12 +125,64 @@ impl SigilClient {
 
         // 4. ZERO-TRUST CLIENT AUDIT: Verify package locally before unpacking!
         let report = Verifier::verify_package(&temp_file_path, None)?;
+        if report.package_name != package_name || report.version != version {
+            let _ = fs::remove_file(&temp_file_path);
+            return Err(ClientError::SecurityAlert(format!(
+                "Package metadata mismatch! Requested: {}@{}, but package claims: {}@{}",
+                package_name, version, report.package_name, report.version
+            )));
+        }
 
-        // 5. Trust Store check
+        // 5. TRANSPARENCY LOG AUDIT: Verify Merkle inclusion proof from Registry
+        let proof_url = format!("{}/api/v1/packages/{}/{}/proof", self.registry_url, package_name, version);
+        if let Ok(proof_resp) = self.http.get(&proof_url).send().await {
+            if proof_resp.status().is_success() {
+                let proof: MerkleInclusionProof = proof_resp.json().await?;
+
+                let info_url = format!("{}/api/v1/packages/{}", self.registry_url, package_name);
+                if let Ok(info_resp) = self.http.get(&info_url).send().await {
+                    if info_resp.status().is_success() {
+                        let info = info_resp.json::<serde_json::Value>().await?;
+                        if let Some(versions) = info["versions"].as_array() {
+                            if let Some(matching_entry) = versions.iter().find(|e| e["version"] == version) {
+                                let prev_hash = matching_entry["prev_log_hash"].as_str().unwrap_or_default();
+                                let canonical_leaf = format!(
+                                    "{}:{}:{}:{}:{}:{}",
+                                    proof.leaf_index,
+                                    report.package_name,
+                                    report.version,
+                                    report.content_hash,
+                                    report.author_pubkey,
+                                    prev_hash
+                                )
+                                .into_bytes();
+
+                                let is_valid = crate::merkle::verify_inclusion_proof_raw(
+                                    &proof.root_hash,
+                                    &canonical_leaf,
+                                    &proof,
+                                )
+                                .map_err(|e| ClientError::Registry(format!("Merkle proof verification error: {}", e)))?;
+
+                                if !is_valid {
+                                    let _ = fs::remove_file(&temp_file_path);
+                                    return Err(ClientError::SecurityAlert(format!(
+                                        "CRITICAL: Merkle transparency log proof failed for {}@{}. Potential split-view attack!",
+                                        package_name, version
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 6. Zero-Trust Keyring / Trust Store check (Strict Fail-Closed)
         if enforce_trust_store {
             let trust_store = TrustStore::load_from(trust_store_path).unwrap_or_default();
-            // If trust store has keys configured, check if this author is authorized
-            if !trust_store.keys.is_empty() && !trust_store.is_trusted(&report.author_pubkey, package_name) {
+            if !trust_store.is_trusted(&report.author_pubkey, package_name) {
+                let _ = fs::remove_file(&temp_file_path);
                 return Err(ClientError::UntrustedPublisher {
                     pubkey: report.author_pubkey,
                     package: package_name.to_string(),
@@ -135,11 +190,11 @@ impl SigilClient {
             }
         }
 
-        // 6. Safe installation with Path-Traversal sandbox protection
+        // 7. Safe installation with Path-Traversal sandbox protection
         let final_install_path = dest_dir.join(&report.package_name);
         let envelope = Packager::unpack_verified(&temp_file_path, &final_install_path)?;
 
-        // 7. Update sigil.lock
+        // 8. Update sigil.lock
         let lockfile_path = Path::new("sigil.lock");
         let mut lockfile = SigilLockfile::load(lockfile_path).unwrap_or_default();
         lockfile.record_package(&envelope);

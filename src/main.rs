@@ -242,9 +242,27 @@ async fn main() {
                     println!("  {} Tamper Check: {}", "•".green(), "PASSED (0 bit difference)".green().bold());
                     println!("\n  {} Declared Capabilities:", "🛡".magenta().bold());
                     println!("    - Network Access     : {}", if report.capabilities.allow_network { "ALLOW".yellow() } else { "DENIED".green() });
+                    if let Some(net) = &report.capabilities.network {
+                        if !net.hosts.is_empty() {
+                            println!("      Allowed Hosts      : {:?}", net.hosts);
+                        }
+                    }
                     println!("    - FS Read Access     : {}", if report.capabilities.allow_fs_read { "ALLOW".yellow() } else { "DENIED".green() });
                     println!("    - FS Write Access    : {}", if report.capabilities.allow_fs_write { "ALLOW".yellow() } else { "DENIED".green() });
+                    if let Some(fs) = &report.capabilities.filesystem {
+                        if !fs.read.is_empty() {
+                            println!("      Allowed FS Read    : {:?}", fs.read);
+                        }
+                        if !fs.write.is_empty() {
+                            println!("      Allowed FS Write   : {:?}", fs.write);
+                        }
+                    }
                     println!("    - Env Vars Access    : {}", if report.capabilities.allow_env { "ALLOW".yellow() } else { "DENIED".green() });
+                    if let Some(env) = &report.capabilities.environment {
+                        if !env.read.is_empty() {
+                            println!("      Allowed Env Vars   : {:?}", env.read);
+                        }
+                    }
                     println!("    - Child Process Spawns: {}", if report.capabilities.allow_child_process { "ALLOW".red().bold() } else { "DENIED".green() });
                 }
                 Err(e) => {
@@ -317,6 +335,23 @@ async fn main() {
                     }
                 } else {
                     println!("{} Key not found in '{}'.", "[-]".yellow().bold(), store_path.display());
+                }
+            }
+            TrustCommands::Revoke { pubkey, reason } => {
+                let mut store = TrustStore::load_from(&store_path).unwrap_or_default();
+                match store.revoke_key(&pubkey, &reason) {
+                    Ok(_) => match store.save_to(&store_path) {
+                        Ok(_) => {
+                            println!("{}", "══════════════════════════════════════════════════════════".red());
+                            println!("  {} {}", "✔".green().bold(), "Publisher Key Revoked & Blacklisted!".bold());
+                            println!("{}", "══════════════════════════════════════════════════════════".red());
+                            println!("  {} Key    : {}", "•".cyan(), pubkey);
+                            println!("  {} Reason : {}", "•".yellow(), reason);
+                            println!("  {} Status : Strictly Forbidden (Zero-Trust Quarantined)", "•".red().bold());
+                        }
+                        Err(e) => eprintln!("{} Failed to save trust store: {}", "[-]".red().bold(), e),
+                    },
+                    Err(e) => eprintln!("{} Failed to revoke key: {}", "[-]".red().bold(), e),
                 }
             }
             TrustCommands::List => {

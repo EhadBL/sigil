@@ -21,9 +21,18 @@ pub struct TrustedKey {
     pub added_at: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevokedKey {
+    pub pubkey: String,
+    pub reason: String,
+    pub revoked_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TrustStore {
     pub keys: Vec<TrustedKey>,
+    #[serde(default)]
+    pub revoked_keys: Vec<RevokedKey>,
 }
 
 impl TrustStore {
@@ -51,9 +60,18 @@ impl TrustStore {
         Ok(())
     }
 
+    /// Adds a public key to the trusted keyring
     pub fn add_key(&mut self, pubkey: String, identity: String, scope: String) -> Result<(), TrustError> {
         if hex::decode(&pubkey).map_err(|e| TrustError::InvalidKey(e.to_string()))?.len() != 32 {
             return Err(TrustError::InvalidKey("Public key must be 32 bytes hex".into()));
+        }
+
+        // Ensure key is not in revoked list
+        if self.is_revoked(&pubkey) {
+            return Err(TrustError::InvalidKey(format!(
+                "Key {} is explicitly marked as revoked and cannot be trusted",
+                pubkey
+            )));
         }
 
         // Remove duplicate if exists
@@ -68,14 +86,47 @@ impl TrustStore {
         Ok(())
     }
 
+    /// Revokes a publisher public key permanently (e.g. upon key compromise or security breach)
+    pub fn revoke_key(&mut self, pubkey: &str, reason: &str) -> Result<(), TrustError> {
+        if hex::decode(pubkey).map_err(|e| TrustError::InvalidKey(e.to_string()))?.len() != 32 {
+            return Err(TrustError::InvalidKey("Public key must be 32 bytes hex".into()));
+        }
+
+        // Remove from trusted list
+        self.keys.retain(|k| !k.pubkey.eq_ignore_ascii_case(pubkey));
+
+        // Add to revoked list if not already present
+        if !self.is_revoked(pubkey) {
+            self.revoked_keys.push(RevokedKey {
+                pubkey: pubkey.to_string(),
+                reason: reason.to_string(),
+                revoked_at: chrono::Utc::now().timestamp(),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Checks if a public key is explicitly revoked
+    pub fn is_revoked(&self, pubkey: &str) -> bool {
+        self.revoked_keys
+            .iter()
+            .any(|k| k.pubkey.eq_ignore_ascii_case(pubkey))
+    }
+
     pub fn remove_key(&mut self, pubkey: &str) -> bool {
         let initial_len = self.keys.len();
-        self.keys.retain(|k| k.pubkey != pubkey);
+        self.keys.retain(|k| !k.pubkey.eq_ignore_ascii_case(pubkey));
         self.keys.len() < initial_len
     }
 
     /// Verifies if a given publisher public key is trusted for a package name
     pub fn is_trusted(&self, pubkey: &str, package_name: &str) -> bool {
+        // Revoked keys are NEVER trusted under any circumstance
+        if self.is_revoked(pubkey) {
+            return false;
+        }
+
         for entry in &self.keys {
             if entry.pubkey.eq_ignore_ascii_case(pubkey) {
                 if entry.scope == "*" {

@@ -1,3 +1,4 @@
+use crate::server::{is_valid_package_name, is_valid_version};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -14,6 +15,31 @@ pub enum ManifestError {
     TomlSerialize(#[from] toml::ser::Error),
     #[error("Invalid manifest: {0}")]
     Validation(String),
+}
+
+/// Fine-grained network capability specification
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct NetworkCapability {
+    #[serde(default)]
+    pub allow: bool,
+    #[serde(default)]
+    pub hosts: Vec<String>,
+}
+
+/// Fine-grained filesystem capability specification
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct FsCapability {
+    #[serde(default)]
+    pub read: Vec<String>,
+    #[serde(default)]
+    pub write: Vec<String>,
+}
+
+/// Fine-grained environment capability specification
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct EnvCapability {
+    #[serde(default)]
+    pub read: Vec<String>,
 }
 
 /// Zero-Trust capability model: Packages must declare what permissions they require.
@@ -34,6 +60,16 @@ pub struct Capabilities {
     /// Does the package spawn child processes? (Strictly audited)
     #[serde(default)]
     pub allow_child_process: bool,
+
+    /// Fine-grained declarative network restrictions (optional)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<NetworkCapability>,
+    /// Fine-grained declarative filesystem restrictions (optional)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filesystem: Option<FsCapability>,
+    /// Fine-grained declarative environment restrictions (optional)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<EnvCapability>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -73,22 +109,18 @@ impl SigilManifest {
         Ok(())
     }
 
-    /// Basic structural validation
+    /// Strict structural validation
     pub fn validate(&self) -> Result<(), ManifestError> {
-        if self.package.name.trim().is_empty() {
-            return Err(ManifestError::Validation("Package name cannot be empty".into()));
-        }
-        if self.package.version.trim().is_empty() {
-            return Err(ManifestError::Validation("Package version cannot be empty".into()));
-        }
-        // Name check: only allow alphanumeric, hyphens, underscores, and forward slashes for scoped packages (@scope/name)
-        let valid_chars = self.package.name.chars().all(|c| {
-            c.is_alphanumeric() || c == '-' || c == '_' || c == '/' || c == '@' || c == '.'
-        });
-        if !valid_chars {
+        if !is_valid_package_name(&self.package.name) {
             return Err(ManifestError::Validation(format!(
-                "Package name contains illegal characters: '{}'",
+                "Invalid package name '{}': must be alphanumeric with optional @scope/",
                 self.package.name
+            )));
+        }
+        if !is_valid_version(&self.package.version) {
+            return Err(ManifestError::Validation(format!(
+                "Invalid package version '{}': must conform to standard SemVer format",
+                self.package.version
             )));
         }
         Ok(())
