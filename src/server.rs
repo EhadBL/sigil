@@ -1,19 +1,60 @@
+use crate::merkle::{MerkleInclusionProof, MerkleTree};
 use crate::verifier::Verifier;
 use axum::{
     body::Bytes,
-    extract::{Path as AxPath, State},
+    extract::{DefaultBodyLimit, Path as AxPath, State},
     http::StatusCode,
     response::Response,
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tower_http::cors::CorsLayer;
+
+pub const MAX_PUBLISH_PAYLOAD_SIZE: usize = 64 * 1024 * 1024; // 64 MB max upload
+
+/// Validates package name to prevent path traversal and enforce naming hygiene
+pub fn is_valid_package_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 128 {
+        return false;
+    }
+    let (scope, pkg) = if name.starts_with('@') {
+        let parts: Vec<&str> = name[1..].split('/').collect();
+        if parts.len() != 2 {
+            return false;
+        }
+        (Some(parts[0]), parts[1])
+    } else {
+        (None, name)
+    };
+
+    if let Some(s) = scope {
+        if s.is_empty() || !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            return false;
+        }
+    }
+
+    if pkg.is_empty() || !pkg.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+        return false;
+    }
+    true
+}
+
+/// Validates SemVer version string
+pub fn is_valid_version(version: &str) -> bool {
+    if version.is_empty() || version.len() > 64 {
+        return false;
+    }
+    version
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+')
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransparencyLogEntry {
@@ -27,9 +68,28 @@ pub struct TransparencyLogEntry {
     pub entry_hash: String,
 }
 
+impl TransparencyLogEntry {
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        format!(
+            "{}:{}:{}:{}:{}:{}",
+            self.index,
+            self.package_name,
+            self.version,
+            self.content_hash,
+            self.author_pubkey,
+            self.prev_log_hash
+        )
+        .into_bytes()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RegistryIndex {
     pub entries: Vec<TransparencyLogEntry>,
+    #[serde(default)]
+    pub package_owners: HashMap<String, String>, // package_name -> author_pubkey
+    #[serde(default)]
+    pub tree_root_head: String,
 }
 
 #[derive(Clone)]
@@ -47,12 +107,20 @@ impl RegistryServer {
         fs::create_dir_all(&packages_dir)?;
 
         let log_file = storage_dir.join("transparency_log.json");
-        let initial_index = if log_file.exists() {
+        let mut initial_index: RegistryIndex = if log_file.exists() {
             let content = fs::read_to_string(&log_file)?;
             serde_json::from_str(&content).unwrap_or_default()
         } else {
             RegistryIndex::default()
         };
+
+        // Ensure tree root head is properly computed
+        if !initial_index.entries.is_empty() && initial_index.tree_root_head.is_empty() {
+            let leaves: Vec<Vec<u8>> = initial_index.entries.iter().map(|e| e.canonical_bytes()).collect();
+            let leaf_slices: Vec<&[u8]> = leaves.iter().map(|l| l.as_slice()).collect();
+            let tree = MerkleTree::from_raw_leaves(&leaf_slices);
+            initial_index.tree_root_head = tree.root_hex();
+        }
 
         let state = ServerState {
             storage_dir,
@@ -62,9 +130,12 @@ impl RegistryServer {
         let app = Router::new()
             .route("/api/v1/health", get(health_handler))
             .route("/api/v1/log", get(log_handler))
+            .route("/api/v1/tree/head", get(tree_head_handler))
             .route("/api/v1/publish", post(publish_handler))
             .route("/api/v1/packages/:name", get(package_info_handler))
+            .route("/api/v1/packages/:name/:version/proof", get(proof_handler))
             .route("/api/v1/packages/:name/:version/download", get(download_handler))
+            .layer(DefaultBodyLimit::max(MAX_PUBLISH_PAYLOAD_SIZE))
             .layer(CorsLayer::permissive())
             .with_state(state);
 
@@ -83,12 +154,23 @@ async fn health_handler(State(state): State<ServerState>) -> Json<serde_json::Va
         "status": "healthy",
         "service": "sigil-transparency-registry",
         "total_packages_logged": log.entries.len(),
+        "tree_root_head": log.tree_root_head,
+        "namespaces_registered": log.package_owners.len(),
     }))
 }
 
 async fn log_handler(State(state): State<ServerState>) -> Json<Vec<TransparencyLogEntry>> {
     let log = state.log_state.lock().unwrap();
     Json(log.entries.clone())
+}
+
+async fn tree_head_handler(State(state): State<ServerState>) -> Json<serde_json::Value> {
+    let log = state.log_state.lock().unwrap();
+    Json(serde_json::json!({
+        "tree_size": log.entries.len(),
+        "root_hash": log.tree_root_head,
+        "timestamp": chrono::Utc::now().timestamp(),
+    }))
 }
 
 async fn publish_handler(
@@ -111,7 +193,7 @@ async fn publish_handler(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
 
-    // ZERO-TRUST INGESTION: Server verifies author cryptographic signature before accepting!
+    // ZERO-TRUST INGESTION: Server verifies author cryptographic signature before accepting
     let report = Verifier::verify_package(&temp_pkg_path, None).map_err(|e| {
         let _ = fs::remove_file(&temp_pkg_path);
         (
@@ -120,8 +202,51 @@ async fn publish_handler(
         )
     })?;
 
-    // Record into append-only Transparency Log
+    // Validate package name and version syntax
+    if !is_valid_package_name(&report.package_name) || !is_valid_version(&report.version) {
+        let _ = fs::remove_file(&temp_pkg_path);
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Package name or version contains invalid characters".into(),
+        ));
+    }
+
     let mut log = state.log_state.lock().unwrap();
+
+    // 1. Namespace Ownership Protection: Prevent package hijacking by unauthorized public keys
+    if let Some(existing_owner) = log.package_owners.get(&report.package_name) {
+        if existing_owner != &report.author_pubkey {
+            let _ = fs::remove_file(&temp_pkg_path);
+            return Err((
+                StatusCode::FORBIDDEN,
+                format!(
+                    "Package namespace '{}' is owned by public key {}. Publish rejected.",
+                    report.package_name, existing_owner
+                ),
+            ));
+        }
+    } else {
+        // First publisher claims ownership of this package namespace
+        log.package_owners.insert(report.package_name.clone(), report.author_pubkey.clone());
+    }
+
+    // 2. Immutability Guarantee: Reject duplicate versions
+    let version_exists = log
+        .entries
+        .iter()
+        .any(|e| e.package_name == report.package_name && e.version == report.version);
+    if version_exists {
+        let _ = fs::remove_file(&temp_pkg_path);
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "Package '{}' version '{}' is already published. Releases in Sigil are strictly immutable.",
+                report.package_name, report.version
+            ),
+        ));
+    }
+
+    // 3. Append to Transparency Log
     let index = log.entries.len() as u64;
     let prev_hash = log
         .entries
@@ -153,13 +278,19 @@ async fn publish_handler(
 
     log.entries.push(entry);
 
-    // Save transparency log to disk
+    // 4. Update Merkle Tree Root Head over all entries
+    let leaves: Vec<Vec<u8>> = log.entries.iter().map(|e| e.canonical_bytes()).collect();
+    let leaf_slices: Vec<&[u8]> = leaves.iter().map(|l| l.as_slice()).collect();
+    let tree = MerkleTree::from_raw_leaves(&leaf_slices);
+    log.tree_root_head = tree.root_hex();
+
+    // 5. Save transparency log to disk
     let log_file = state.storage_dir.join("transparency_log.json");
     if let Ok(json) = serde_json::to_string_pretty(&*log) {
         let _ = fs::write(log_file, json);
     }
 
-    // Save package into permanent content-addressable storage
+    // 6. Save package into permanent content-addressable storage
     let pkg_storage_name = format!("{}-{}.sigil", report.package_name.replace('/', "-"), report.version);
     let target_path = state.storage_dir.join("packages").join(pkg_storage_name);
     fs::rename(&temp_pkg_path, &target_path).map_err(|e| {
@@ -168,11 +299,12 @@ async fn publish_handler(
 
     Ok(Json(serde_json::json!({
         "status": "success",
-        "message": "Package verified and sealed into transparency log",
+        "message": "Package verified, sealed into transparency log, and namespace locked",
         "package": report.package_name,
         "version": report.version,
         "log_index": index,
-        "entry_hash": entry_hash
+        "entry_hash": entry_hash,
+        "tree_root_head": log.tree_root_head
     })))
 }
 
@@ -180,6 +312,10 @@ async fn package_info_handler(
     State(state): State<ServerState>,
     AxPath(name): AxPath<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !is_valid_package_name(&name) {
+        return Err((StatusCode::BAD_REQUEST, "Invalid package name format".into()));
+    }
+
     let log = state.log_state.lock().unwrap();
     let matching_versions: Vec<&TransparencyLogEntry> = log
         .entries
@@ -191,19 +327,66 @@ async fn package_info_handler(
         return Err((StatusCode::NOT_FOUND, format!("Package '{}' not found", name)));
     }
 
+    let owner = log.package_owners.get(&name).cloned();
+
     Ok(Json(serde_json::json!({
         "package": name,
+        "owner_pubkey": owner,
         "versions": matching_versions,
     })))
+}
+
+async fn proof_handler(
+    State(state): State<ServerState>,
+    AxPath((name, version)): AxPath<(String, String)>,
+) -> Result<Json<MerkleInclusionProof>, (StatusCode, String)> {
+    if !is_valid_package_name(&name) || !is_valid_version(&version) {
+        return Err((StatusCode::BAD_REQUEST, "Invalid package name or version format".into()));
+    }
+
+    let log = state.log_state.lock().unwrap();
+    let entry_idx = log
+        .entries
+        .iter()
+        .position(|e| e.package_name == name && e.version == version)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Package '{}-{}' not found in transparency log", name, version),
+            )
+        })?;
+
+    let leaves: Vec<Vec<u8>> = log.entries.iter().map(|e| e.canonical_bytes()).collect();
+    let leaf_slices: Vec<&[u8]> = leaves.iter().map(|l| l.as_slice()).collect();
+    let tree = MerkleTree::from_raw_leaves(&leaf_slices);
+
+    let proof = tree.generate_inclusion_proof(entry_idx).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to generate Merkle inclusion proof: {}", e),
+        )
+    })?;
+
+    Ok(Json(proof))
 }
 
 async fn download_handler(
     State(state): State<ServerState>,
     AxPath((name, version)): AxPath<(String, String)>,
 ) -> Result<Response, (StatusCode, String)> {
-    let pkg_file_name = format!("{}-{}.sigil", name.replace('/', "-"), version);
-    let path = state.storage_dir.join("packages").join(&pkg_file_name);
+    if !is_valid_package_name(&name) || !is_valid_version(&version) {
+        return Err((StatusCode::BAD_REQUEST, "Invalid package name or version format".into()));
+    }
 
+    let packages_dir = match state.storage_dir.join("packages").canonicalize() {
+        Ok(dir) => dir,
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Storage directory error: {}", e))),
+    };
+
+    let pkg_file_name = format!("{}-{}.sigil", name.replace('/', "-"), version);
+    let path = packages_dir.join(&pkg_file_name);
+
+    // Boundary containment check to strictly prevent path traversal
     if !path.exists() {
         return Err((
             StatusCode::NOT_FOUND,
@@ -211,7 +394,16 @@ async fn download_handler(
         ));
     }
 
-    let bytes = fs::read(&path)
+    let canonical_file = match path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return Err((StatusCode::NOT_FOUND, "File not found".into())),
+    };
+
+    if !canonical_file.starts_with(&packages_dir) {
+        return Err((StatusCode::BAD_REQUEST, "Invalid path resolution".into()));
+    }
+
+    let bytes = fs::read(&canonical_file)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Read error: {}", e)))?;
 
     let response = Response::builder()
