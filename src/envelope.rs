@@ -81,15 +81,8 @@ impl SigilEnvelope {
         // Sort files canonically by path for deterministic tree calculation
         files.sort_by(|a, b| a.path.cmp(&b.path));
 
-        // Compute tree root hash over all file paths and their individual BLAKE3 hashes
-        let mut tree_hasher = blake3::Hasher::new();
-        for file in &files {
-            tree_hasher.update(file.path.as_bytes());
-            tree_hasher.update(b":");
-            tree_hasher.update(file.blake3_hash.as_bytes());
-            tree_hasher.update(b";");
-        }
-        let tree_root_hash = tree_hasher.finalize().to_hex().to_string();
+        // Compute genuine binary Merkle tree root hash over all canonical file records
+        let tree_root_hash = crate::merkle::compute_files_merkle_tree(&files).root_hex();
 
         let canonical = Self::canonical_payload(
             &manifest.package.name,

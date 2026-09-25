@@ -4,6 +4,7 @@ pub mod crypto;
 pub mod envelope;
 pub mod lockfile;
 pub mod manifest;
+pub mod merkle;
 pub mod packager;
 pub mod server;
 pub mod trust;
