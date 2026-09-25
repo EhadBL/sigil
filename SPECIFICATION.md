@@ -108,10 +108,10 @@ $$\text{Interior Node Hash } H_{\text{node}}(L, R) = \text{BLAKE3}(0\text{x}01 \
 
 ### 4.2. Author Signature Verification
 1. Reconstruct the canonical byte payload:
-   $$\text{Canonical Payload} = \text{JCS}(\{ \text{name}, \text{version}, \text{content\_hash}, \text{tree\_root\_hash}, \text{timestamp}, \text{author\_pubkey}, \text{capabilities} \})$$
+   $$\text{Canonical Payload} = \text{JCS}(\{ \text{name}, \text{version}, \text{content\_hash}, \text{tree\_root\_hash}, \text{timestamp}, \text{author\_pubkey}, \text{capabilities}, \text{dependencies} \})$$
 2. Decode 64-byte Ed25519 signature $\sigma$.
 3. Execute `ed25519::verify(author_pubkey, Canonical Payload, \sigma)`.
-4. Any bit modification in code, manifest, or capabilities invalidates the signature.
+4. Any bit modification in code, manifest, capabilities, or declared dependencies invalidates the cryptographic signature.
 
 ---
 
@@ -137,6 +137,27 @@ When receiving a `POST /api/v1/publish` request:
 | `GET` | `/api/v1/packages/:name` | Retrieves package versions and owner public key |
 | `GET` | `/api/v1/packages/:name/:version/proof` | Returns RFC 6962 Merkle Inclusion Proof |
 | `GET` | `/api/v1/packages/:name/:version/download` | Downloads verified `.sigil` file |
+
+### 5.3. Trust-On-First-Use (TOFU) & Namespace Threat Model
+In the current MVP architecture, registry namespace reservation operates on a **Trust-On-First-Use (TOFU)** basis:
+- The first entity to publish `@scope/pkg` or `pkg` locks the namespace to their Ed25519 public key.
+- **Threat Vector:** Malicious actors or squatters may claim reputable package names or organization scopes prior to the legitimate maintainer registering.
+
+#### Defense in Depth & Mitigation Roadmap
+1. **Client-Side Key Pinning (`sigil.trust.json`):**
+   Clients do not blindly trust the registry's namespace mapping. Under `--enforce-trust`, the client strictly cross-references the package name and scope against locally pinned public keys. An unauthorized public key claiming a trusted scope is blocked at installation time.
+2. **Federated Identity & OIDC Attestation (Roadmap):**
+   Integration with OIDC identity tokens (Sigstore/Fulcio model), where keys are bound to cryptographic short-lived certificates issued via GitHub Actions, GitLab CI, or Google Workspace workflows.
+3. **Domain & DNS Identity Verification (Roadmap):**
+   Scoped organizations (e.g. `@acme/*`) must verify ownership via cryptographic DNS TXT challenge records (`_sigil-challenge.acme.com`) before the registry permits publishing.
+
+### 5.4. Fail-Closed Client Transparency Verification
+During package installation via `sigil add`, the client executes a zero-trust audit against the transparency log:
+1. Queries the Merkle inclusion proof for the exact package version.
+2. Computes the canonical leaf hash $D_i$ from local package metadata and the previous log link.
+3. Validates the inclusion path against the registry root hash.
+4. **Fail-Closed Guarantee:** If the registry returns an HTTP error, 404, or an invalid Merkle proof, the client immediately aborts installation and purges inbound artifacts. Split-view and log omission attacks are caught prior to extraction.
+5. In isolated offline or local testing environments, users can explicitly opt out using the `--skip-transparency-proof` flag.
 
 ---
 
