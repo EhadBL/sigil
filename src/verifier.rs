@@ -3,9 +3,9 @@ use crate::envelope::{FileRecord, SigilEnvelope};
 use crate::manifest::Capabilities;
 use crate::packager::{MAX_ENVELOPE_SIZE, MAX_SINGLE_FILE_SIZE, MAX_TOTAL_UNPACKED_SIZE};
 use flate2::read::GzDecoder;
-use std::fs::File;
-use std::io::Read;
-use std::path::Path;
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::path::{Component, Path};
 use tar::Archive;
 use thiserror::Error;
 
@@ -43,11 +43,21 @@ pub struct VerificationReport {
 pub struct Verifier;
 
 impl Verifier {
-    /// Performs a full zero-trust cryptographic audit and verification of a `.sigil` package.
+    /// Performs a full zero-trust cryptographic audit of a `.sigil` package without unpacking.
     pub fn verify_package<P: AsRef<Path>>(
         package_file: P,
         expected_pubkey: Option<&str>,
     ) -> Result<VerificationReport, VerifierError> {
+        Self::verify_and_extract::<_, &Path>(package_file, expected_pubkey, None).map(|(report, _)| report)
+    }
+
+    /// Single unified zero-trust verification and sandboxed extraction engine.
+    /// Eliminates parser differential vulnerabilities by sharing identical verification and extraction logic.
+    pub fn verify_and_extract<P: AsRef<Path>, D: AsRef<Path>>(
+        package_file: P,
+        expected_pubkey: Option<&str>,
+        dest_dir: Option<D>,
+    ) -> Result<(VerificationReport, SigilEnvelope), VerifierError> {
         let file = File::open(package_file)?;
         let mut bundle = Archive::new(file);
 
@@ -92,13 +102,13 @@ impl Verifier {
         if let Some(expected) = expected_pubkey {
             if envelope.author_pubkey != expected {
                 return Err(VerifierError::KeyMismatch {
-                    actual: envelope.author_pubkey,
+                    actual: envelope.author_pubkey.clone(),
                     expected: expected.to_string(),
                 });
             }
         }
 
-        // 2. Cryptographic Signature Verification (Ed25519)
+        // 2. Cryptographic Signature Verification (Ed25519 over Canonical Payload including Dependencies)
         envelope
             .verify_signature()
             .map_err(|e| VerifierError::Tampered(format!("Invalid Ed25519 signature: {}", e)))?;
@@ -112,7 +122,11 @@ impl Verifier {
             )));
         }
 
-        // 4. File-by-File Hash & Tree Merkle Root Verification
+        // 4. File-by-File Hash & Tree Merkle Root Verification + Optional Sandboxed Extraction
+        if let Some(ref dest) = dest_dir {
+            fs::create_dir_all(dest.as_ref())?;
+        }
+
         let gz = GzDecoder::new(&content_tar_bytes[..]);
         let mut inner_tar = Archive::new(gz);
 
@@ -123,14 +137,19 @@ impl Verifier {
             let mut entry = entry?;
             let entry_type = entry.header().entry_type();
 
+            // Zero-Trust Sandbox Invariant: Reject symlinks and hardlinks
             if entry_type.is_symlink() || entry_type.is_hard_link() {
                 return Err(VerifierError::SecurityViolation(format!(
-                    "Forbidden symlink or hardlink entry detected: {:?}",
+                    "Forbidden symlink or hardlink entry detected in package: {:?}",
                     entry.path()?
                 )));
             }
 
             if entry_type.is_dir() {
+                if let Some(ref dest) = dest_dir {
+                    let target_dir = dest.as_ref().join(entry.path()?);
+                    fs::create_dir_all(&target_dir)?;
+                }
                 continue;
             }
 
@@ -141,7 +160,34 @@ impl Verifier {
                 )));
             }
 
-            let rel_path = entry.path()?.to_string_lossy().replace('\\', "/");
+            let entry_path = entry.path()?.to_path_buf();
+            let rel_path = entry_path.to_string_lossy().replace('\\', "/");
+
+            if rel_path.contains(':') || rel_path.contains('\0') {
+                return Err(VerifierError::SecurityViolation(format!(
+                    "Illegal path characters detected in package: '{}'",
+                    rel_path
+                )));
+            }
+
+            for comp in entry_path.components() {
+                match comp {
+                    Component::ParentDir => {
+                        return Err(VerifierError::SecurityViolation(format!(
+                            "Parent directory traversal ('..') detected: {:?}",
+                            entry_path
+                        )));
+                    }
+                    Component::Prefix(_) | Component::RootDir => {
+                        return Err(VerifierError::SecurityViolation(format!(
+                            "Absolute path detected in package: {:?}",
+                            entry_path
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+
             let declared_size = entry.size();
             if declared_size > MAX_SINGLE_FILE_SIZE {
                 return Err(VerifierError::SecurityViolation(format!(
@@ -173,10 +219,20 @@ impl Verifier {
             let size = file_content.len() as u64;
 
             extracted_records.push(FileRecord {
-                path: rel_path,
+                path: rel_path.clone(),
                 blake3_hash: file_hash,
                 size_bytes: size,
             });
+
+            // Extract file safely if destination directory is provided
+            if let Some(ref dest) = dest_dir {
+                let target_path = dest.as_ref().join(&entry_path);
+                if let Some(parent) = target_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let mut out_file = File::create(&target_path)?;
+                out_file.write_all(&file_content)?;
+            }
         }
         extracted_records.sort_by(|a, b| a.path.cmp(&b.path));
 
@@ -197,16 +253,18 @@ impl Verifier {
             ));
         }
 
-        Ok(VerificationReport {
+        let report = VerificationReport {
             is_valid: true,
-            package_name: envelope.manifest.package.name,
-            version: envelope.manifest.package.version,
-            author_pubkey: envelope.author_pubkey,
-            content_hash: envelope.content_hash,
-            tree_root_hash: envelope.tree_root_hash,
+            package_name: envelope.manifest.package.name.clone(),
+            version: envelope.manifest.package.version.clone(),
+            author_pubkey: envelope.author_pubkey.clone(),
+            content_hash: envelope.content_hash.clone(),
+            tree_root_hash: envelope.tree_root_hash.clone(),
             total_files: extracted_records.len(),
             timestamp: envelope.timestamp,
-            capabilities: envelope.manifest.capabilities,
-        })
+            capabilities: envelope.manifest.capabilities.clone(),
+        };
+
+        Ok((report, envelope))
     }
 }
