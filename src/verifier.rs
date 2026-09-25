@@ -1,6 +1,7 @@
 use crate::crypto::{self, CryptoError};
 use crate::envelope::{FileRecord, SigilEnvelope};
 use crate::manifest::Capabilities;
+use crate::packager::{MAX_ENVELOPE_SIZE, MAX_SINGLE_FILE_SIZE, MAX_TOTAL_UNPACKED_SIZE};
 use flate2::read::GzDecoder;
 use std::fs::File;
 use std::io::Read;
@@ -22,6 +23,8 @@ pub enum VerifierError {
     KeyMismatch { actual: String, expected: String },
     #[error("Archive format error: {0}")]
     Archive(String),
+    #[error("Security violation: {0}")]
+    SecurityViolation(String),
 }
 
 #[derive(Debug, Clone)]
@@ -52,16 +55,26 @@ impl Verifier {
         let mut content_tar_bytes = None;
 
         for entry in bundle.entries()? {
-            let mut entry = entry?;
+            let entry = entry?;
             let path_str = entry.path()?.to_string_lossy().to_string();
 
             if path_str == "envelope.sigil.json" {
                 let mut buf = Vec::new();
-                entry.read_to_end(&mut buf)?;
+                entry.take(MAX_ENVELOPE_SIZE + 1).read_to_end(&mut buf)?;
+                if buf.len() as u64 > MAX_ENVELOPE_SIZE {
+                    return Err(VerifierError::SecurityViolation(
+                        "Envelope size exceeds maximum allowed threshold".into(),
+                    ));
+                }
                 envelope_bytes = Some(buf);
             } else if path_str == "content.tar.gz" {
                 let mut buf = Vec::new();
-                entry.read_to_end(&mut buf)?;
+                entry.take(MAX_TOTAL_UNPACKED_SIZE + 1).read_to_end(&mut buf)?;
+                if buf.len() as u64 > MAX_TOTAL_UNPACKED_SIZE {
+                    return Err(VerifierError::SecurityViolation(
+                        "Compressed content exceeds maximum size threshold".into(),
+                    ));
+                }
                 content_tar_bytes = Some(buf);
             }
         }
@@ -104,11 +117,57 @@ impl Verifier {
         let mut inner_tar = Archive::new(gz);
 
         let mut extracted_records = Vec::new();
+        let mut total_unpacked_bytes: u64 = 0;
+
         for entry in inner_tar.entries()? {
             let mut entry = entry?;
+            let entry_type = entry.header().entry_type();
+
+            if entry_type.is_symlink() || entry_type.is_hard_link() {
+                return Err(VerifierError::SecurityViolation(format!(
+                    "Forbidden symlink or hardlink entry detected: {:?}",
+                    entry.path()?
+                )));
+            }
+
+            if entry_type.is_dir() {
+                continue;
+            }
+
+            if !entry_type.is_file() {
+                return Err(VerifierError::SecurityViolation(format!(
+                    "Unsupported archive entry type in package: {:?}",
+                    entry_type
+                )));
+            }
+
             let rel_path = entry.path()?.to_string_lossy().replace('\\', "/");
+            let declared_size = entry.size();
+            if declared_size > MAX_SINGLE_FILE_SIZE {
+                return Err(VerifierError::SecurityViolation(format!(
+                    "File '{}' exceeds maximum allowed size ({} > {})",
+                    rel_path, declared_size, MAX_SINGLE_FILE_SIZE
+                )));
+            }
+
             let mut file_content = Vec::new();
-            entry.read_to_end(&mut file_content)?;
+            let mut limited = (&mut entry).take(MAX_SINGLE_FILE_SIZE + 1);
+            limited.read_to_end(&mut file_content)?;
+
+            if file_content.len() as u64 > MAX_SINGLE_FILE_SIZE {
+                return Err(VerifierError::SecurityViolation(format!(
+                    "File '{}' exceeded maximum allowed size during verification (potential decompression bomb)",
+                    rel_path
+                )));
+            }
+
+            total_unpacked_bytes += file_content.len() as u64;
+            if total_unpacked_bytes > MAX_TOTAL_UNPACKED_SIZE {
+                return Err(VerifierError::SecurityViolation(format!(
+                    "Cumulative package size exceeded maximum threshold ({} bytes)",
+                    MAX_TOTAL_UNPACKED_SIZE
+                )));
+            }
 
             let file_hash = crypto::hash_bytes(&file_content).to_hex().to_string();
             let size = file_content.len() as u64;
@@ -122,14 +181,7 @@ impl Verifier {
         extracted_records.sort_by(|a, b| a.path.cmp(&b.path));
 
         // Recompute Merkle tree root hash
-        let mut tree_hasher = blake3::Hasher::new();
-        for file in &extracted_records {
-            tree_hasher.update(file.path.as_bytes());
-            tree_hasher.update(b":");
-            tree_hasher.update(file.blake3_hash.as_bytes());
-            tree_hasher.update(b";");
-        }
-        let computed_tree_root = tree_hasher.finalize().to_hex().to_string();
+        let computed_tree_root = crate::merkle::compute_files_merkle_tree(&extracted_records).root_hex();
 
         if computed_tree_root != envelope.tree_root_hash {
             return Err(VerifierError::Tampered(format!(

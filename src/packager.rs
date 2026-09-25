@@ -5,8 +5,9 @@ use ed25519_dalek::SigningKey;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path};
 use tar::{Archive, Builder, Header};
 use thiserror::Error;
@@ -26,7 +27,14 @@ pub enum PackagerError {
     Integrity(String),
     #[error("Package archive format invalid: {0}")]
     InvalidArchive(String),
+    #[error("Security violation: {0}")]
+    SecurityViolation(String),
 }
+
+/// Strict decompression and size limits to prevent Decompression Bomb (DoS / OOM)
+pub const MAX_SINGLE_FILE_SIZE: u64 = 64 * 1024 * 1024; // 64 MB max per file
+pub const MAX_TOTAL_UNPACKED_SIZE: u64 = 256 * 1024 * 1024; // 256 MB max cumulative package size
+pub const MAX_ENVELOPE_SIZE: u64 = 5 * 1024 * 1024; // 5 MB max envelope metadata
 
 pub struct Packager;
 
@@ -136,7 +144,7 @@ impl Packager {
     }
 
     /// Safely unpacks a verified package archive into the destination directory.
-    /// Strictly protects against Path Traversal, symlink escapes, and zero-day script execution.
+    /// Strictly protects against Path Traversal, symlink escapes, decompression bombs, and tampering.
     pub fn unpack_verified<P: AsRef<Path>, D: AsRef<Path>>(
         package_file: P,
         dest_dir: D,
@@ -149,16 +157,26 @@ impl Packager {
         let mut content_tar_bytes = None;
 
         for entry in bundle_archive.entries()? {
-            let mut entry = entry?;
+            let entry = entry?;
             let path_str = entry.path()?.to_string_lossy().to_string();
 
             if path_str == "envelope.sigil.json" {
                 let mut buf = Vec::new();
-                entry.read_to_end(&mut buf)?;
+                entry.take(MAX_ENVELOPE_SIZE + 1).read_to_end(&mut buf)?;
+                if buf.len() as u64 > MAX_ENVELOPE_SIZE {
+                    return Err(PackagerError::SecurityViolation(
+                        "Envelope size exceeds maximum allowed threshold".into(),
+                    ));
+                }
                 envelope_bytes = Some(buf);
             } else if path_str == "content.tar.gz" {
                 let mut buf = Vec::new();
-                entry.read_to_end(&mut buf)?;
+                entry.take(MAX_TOTAL_UNPACKED_SIZE + 1).read_to_end(&mut buf)?;
+                if buf.len() as u64 > MAX_TOTAL_UNPACKED_SIZE {
+                    return Err(PackagerError::SecurityViolation(
+                        "Compressed content exceeds maximum size threshold".into(),
+                    ));
+                }
                 content_tar_bytes = Some(buf);
             }
         }
@@ -173,7 +191,12 @@ impl Packager {
         let envelope: SigilEnvelope = serde_json::from_slice(&envelope_bytes)
             .map_err(|e| PackagerError::Envelope(e.into()))?;
 
-        // Verify content integrity
+        // 1. Verify cryptographic signature of the envelope itself
+        envelope
+            .verify_signature()
+            .map_err(|e| PackagerError::SecurityViolation(format!("Cryptographic signature invalid: {}", e)))?;
+
+        // 2. Verify bit-for-bit content tarball hash
         let computed_content_hash = crypto::hash_bytes(&content_tar_bytes).to_hex().to_string();
         if computed_content_hash != envelope.content_hash {
             return Err(PackagerError::Integrity(format!(
@@ -182,28 +205,61 @@ impl Packager {
             )));
         }
 
-        // Unpack content.tar.gz safely
+        // 3. Create destination directory
+        fs::create_dir_all(dest_dir)?;
+
+        let mut envelope_file_map: HashMap<String, &FileRecord> = HashMap::new();
+        for file_rec in &envelope.files {
+            envelope_file_map.insert(file_rec.path.clone(), file_rec);
+        }
+
+        // 4. Unpack content.tar.gz safely with strict zero-trust sandbox rules
         let gz = GzDecoder::new(&content_tar_bytes[..]);
         let mut inner_tar = Archive::new(gz);
 
-        fs::create_dir_all(dest_dir)?;
+        let mut total_unpacked_bytes: u64 = 0;
+        let mut extracted_files = HashSet::new();
 
         for entry in inner_tar.entries()? {
             let mut entry = entry?;
-            let entry_path = entry.path()?;
+            let entry_type = entry.header().entry_type();
 
-            // Zero-Trust Sandbox Protection: Sanitize and prevent Zip-Slip / Path Traversal
+            // Zero-Trust Sandbox: Strictly forbid symlinks and hardlinks
+            if entry_type.is_symlink() || entry_type.is_hard_link() {
+                return Err(PackagerError::SecurityViolation(format!(
+                    "Symlinks and hardlinks are strictly prohibited in Sigil packages: {:?}",
+                    entry.path()?
+                )));
+            }
+
+            if !entry_type.is_file() && !entry_type.is_dir() {
+                return Err(PackagerError::SecurityViolation(format!(
+                    "Unsupported archive entry type in package: {:?}",
+                    entry_type
+                )));
+            }
+
+            let entry_path = entry.path()?.to_path_buf();
+            let rel_str = entry_path.to_string_lossy().replace('\\', "/");
+
+            if rel_str.contains(':') || rel_str.contains('\0') {
+                return Err(PackagerError::PathTraversal(format!(
+                    "Illegal path characters detected: '{}'",
+                    rel_str
+                )));
+            }
+
             for comp in entry_path.components() {
                 match comp {
                     Component::ParentDir => {
                         return Err(PackagerError::PathTraversal(format!(
-                            "Path traversal detected in package: {:?}",
+                            "Parent directory traversal ('..') detected: {:?}",
                             entry_path
                         )));
                     }
                     Component::Prefix(_) | Component::RootDir => {
                         return Err(PackagerError::PathTraversal(format!(
-                            "Absolute path detected in package: {:?}",
+                            "Absolute path detected: {:?}",
                             entry_path
                         )));
                     }
@@ -212,12 +268,74 @@ impl Packager {
             }
 
             let target_path = dest_dir.join(&entry_path);
+
+            if entry_type.is_dir() {
+                fs::create_dir_all(&target_path)?;
+                continue;
+            }
+
+            // Regular file: size limit check to prevent Decompression Bomb (Tar Bomb / OOM)
+            let declared_size = entry.size();
+            if declared_size > MAX_SINGLE_FILE_SIZE {
+                return Err(PackagerError::SecurityViolation(format!(
+                    "File '{}' exceeds maximum allowed size ({} > {})",
+                    rel_str, declared_size, MAX_SINGLE_FILE_SIZE
+                )));
+            }
+
+            let mut content = Vec::new();
+            let mut limited = (&mut entry).take(MAX_SINGLE_FILE_SIZE + 1);
+            limited.read_to_end(&mut content)?;
+
+            if content.len() as u64 > MAX_SINGLE_FILE_SIZE {
+                return Err(PackagerError::SecurityViolation(format!(
+                    "File '{}' exceeded maximum allowed size during extraction (potential decompression bomb)",
+                    rel_str
+                )));
+            }
+
+            total_unpacked_bytes += content.len() as u64;
+            if total_unpacked_bytes > MAX_TOTAL_UNPACKED_SIZE {
+                return Err(PackagerError::SecurityViolation(format!(
+                    "Cumulative package size exceeded maximum threshold ({} bytes)",
+                    MAX_TOTAL_UNPACKED_SIZE
+                )));
+            }
+
+            // Verify individual file content hash against envelope file record
+            let file_hash = crypto::hash_bytes(&content).to_hex().to_string();
+            if let Some(expected_record) = envelope_file_map.get(&rel_str) {
+                if expected_record.blake3_hash != file_hash {
+                    return Err(PackagerError::Integrity(format!(
+                        "File hash mismatch for '{}'! Expected: {}, Found: {}",
+                        rel_str, expected_record.blake3_hash, file_hash
+                    )));
+                }
+                extracted_files.insert(rel_str.clone());
+            } else {
+                return Err(PackagerError::Integrity(format!(
+                    "Archive contains unexpected file '{}' not listed in signed envelope",
+                    rel_str
+                )));
+            }
+
+            // Ensure parent directory exists
             if let Some(parent) = target_path.parent() {
                 fs::create_dir_all(parent)?;
             }
 
             let mut out_file = File::create(&target_path)?;
-            io::copy(&mut entry, &mut out_file)?;
+            out_file.write_all(&content)?;
+        }
+
+        // Verify that all files listed in the signed envelope were present in the payload
+        for expected in &envelope.files {
+            if !extracted_files.contains(&expected.path) {
+                return Err(PackagerError::Integrity(format!(
+                    "Expected file '{}' was missing from package payload",
+                    expected.path
+                )));
+            }
         }
 
         Ok(envelope)
