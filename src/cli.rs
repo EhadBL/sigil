@@ -97,6 +97,10 @@ pub enum Commands {
         /// Enforce that author public key must be registered in the trust store
         #[arg(long, default_value_t = false)]
         enforce_trust: bool,
+
+        /// Bypass fail-closed Merkle transparency log proof validation (INSECURE: local/dev only)
+        #[arg(long, default_value_t = false)]
+        skip_transparency_proof: bool,
     },
 
     /// Cryptographically pack, sign, and publish package to a Sigil Transparency Registry

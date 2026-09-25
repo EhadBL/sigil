@@ -207,11 +207,29 @@ async fn main() {
             }
         }
 
-        Commands::Add { package, version, registry, dest, trust_store, enforce_trust } => {
+        Commands::Add {
+            package,
+            version,
+            registry,
+            dest,
+            trust_store,
+            enforce_trust,
+            skip_transparency_proof,
+        } => {
             let client = SigilClient::new(&registry);
             println!("{} Fetching '{}' from Transparency Registry ({})...", "📥".cyan().bold(), package.bold(), registry);
 
-            match client.install_package(&package, version.as_deref(), &dest, &trust_store, enforce_trust).await {
+            match client
+                .install_package(
+                    &package,
+                    version.as_deref(),
+                    &dest,
+                    &trust_store,
+                    enforce_trust,
+                    skip_transparency_proof,
+                )
+                .await
+            {
                 Ok(installed_path) => {
                     println!("{}", "══════════════════════════════════════════════════════════".green());
                     println!("  {} {}", "✔".green().bold(), "Package Downloaded, Cryptographically Audited & Installed!".bold());

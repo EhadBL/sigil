@@ -72,6 +72,7 @@ impl SigilClient {
         dest_dir: &Path,
         trust_store_path: &Path,
         enforce_trust_store: bool,
+        skip_transparency_proof: bool,
     ) -> Result<PathBuf, ClientError> {
         // 1. Resolve version
         let version = match version_opt {
@@ -133,48 +134,73 @@ impl SigilClient {
             )));
         }
 
-        // 5. TRANSPARENCY LOG AUDIT: Verify Merkle inclusion proof from Registry
-        let proof_url = format!("{}/api/v1/packages/{}/{}/proof", self.registry_url, package_name, version);
-        if let Ok(proof_resp) = self.http.get(&proof_url).send().await {
-            if proof_resp.status().is_success() {
-                let proof: MerkleInclusionProof = proof_resp.json().await?;
+        // 5. TRANSPARENCY LOG AUDIT: Verify Merkle inclusion proof from Registry (Strict Fail-Closed)
+        if !skip_transparency_proof {
+            let proof_url = format!("{}/api/v1/packages/{}/{}/proof", self.registry_url, package_name, version);
+            let proof_resp = self.http.get(&proof_url).send().await?;
+            if !proof_resp.status().is_success() {
+                let _ = fs::remove_file(&temp_file_path);
+                return Err(ClientError::SecurityAlert(format!(
+                    "CRITICAL: Failed to retrieve transparency log proof from registry at {}: HTTP {}. Installation aborted (fail-closed).",
+                    proof_url,
+                    proof_resp.status()
+                )));
+            }
+            let proof: MerkleInclusionProof = proof_resp.json().await?;
 
-                let info_url = format!("{}/api/v1/packages/{}", self.registry_url, package_name);
-                if let Ok(info_resp) = self.http.get(&info_url).send().await {
-                    if info_resp.status().is_success() {
-                        let info = info_resp.json::<serde_json::Value>().await?;
-                        if let Some(versions) = info["versions"].as_array() {
-                            if let Some(matching_entry) = versions.iter().find(|e| e["version"] == version) {
-                                let prev_hash = matching_entry["prev_log_hash"].as_str().unwrap_or_default();
-                                let canonical_leaf = format!(
-                                    "{}:{}:{}:{}:{}:{}",
-                                    proof.leaf_index,
-                                    report.package_name,
-                                    report.version,
-                                    report.content_hash,
-                                    report.author_pubkey,
-                                    prev_hash
-                                )
-                                .into_bytes();
+            let info_url = format!("{}/api/v1/packages/{}", self.registry_url, package_name);
+            let info_resp = self.http.get(&info_url).send().await?;
+            if !info_resp.status().is_success() {
+                let _ = fs::remove_file(&temp_file_path);
+                return Err(ClientError::SecurityAlert(format!(
+                    "CRITICAL: Failed to retrieve package metadata from registry at {}: HTTP {}. Installation aborted (fail-closed).",
+                    info_url,
+                    info_resp.status()
+                )));
+            }
 
-                                let is_valid = crate::merkle::verify_inclusion_proof_raw(
-                                    &proof.root_hash,
-                                    &canonical_leaf,
-                                    &proof,
-                                )
-                                .map_err(|e| ClientError::Registry(format!("Merkle proof verification error: {}", e)))?;
+            let info = info_resp.json::<serde_json::Value>().await?;
+            let versions = info["versions"].as_array().ok_or_else(|| {
+                let _ = fs::remove_file(&temp_file_path);
+                ClientError::SecurityAlert("Corrupted metadata: versions array missing from registry response".into())
+            })?;
 
-                                if !is_valid {
-                                    let _ = fs::remove_file(&temp_file_path);
-                                    return Err(ClientError::SecurityAlert(format!(
-                                        "CRITICAL: Merkle transparency log proof failed for {}@{}. Potential split-view attack!",
-                                        package_name, version
-                                    )));
-                                }
-                            }
-                        }
-                    }
-                }
+            let matching_entry = versions.iter().find(|e| e["version"] == version).ok_or_else(|| {
+                let _ = fs::remove_file(&temp_file_path);
+                ClientError::SecurityAlert(format!(
+                    "Version {} missing from registry version metadata for package {}",
+                    version, package_name
+                ))
+            })?;
+
+            let prev_hash = matching_entry["prev_log_hash"].as_str().unwrap_or_default();
+            let canonical_leaf = format!(
+                "{}:{}:{}:{}:{}:{}",
+                proof.leaf_index,
+                report.package_name,
+                report.version,
+                report.content_hash,
+                report.author_pubkey,
+                prev_hash
+            )
+            .into_bytes();
+
+            let is_valid = crate::merkle::verify_inclusion_proof_raw(
+                &proof.root_hash,
+                &canonical_leaf,
+                &proof,
+            )
+            .map_err(|e| {
+                let _ = fs::remove_file(&temp_file_path);
+                ClientError::Registry(format!("Merkle proof verification error: {}", e))
+            })?;
+
+            if !is_valid {
+                let _ = fs::remove_file(&temp_file_path);
+                return Err(ClientError::SecurityAlert(format!(
+                    "CRITICAL: Merkle transparency log proof failed for {}@{}. Potential split-view attack!",
+                    package_name, version
+                )));
             }
         }
 
